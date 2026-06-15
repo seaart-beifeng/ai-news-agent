@@ -1,0 +1,214 @@
+{
+  "language": "zh-CN",
+  "timezone": "Asia/Shanghai",
+  "lookback_hours": 30,
+  "max_items_per_source": 20,
+  "max_items_before_ai": 80,
+  "max_items_in_report": 18,
+  "max_items_for_ai": 18,
+  "openai_timeout_seconds": 180,
+  "detail_fetch": {
+    "enabled": true,
+    "max_items": 18,
+    "max_chars": 1800
+  },
+  "min_score": 4,
+  "candidate_kind_limits": {
+    "rss": 28,
+    "news": 20,
+    "arxiv": 24,
+    "github": 12
+  },
+  "report_kind_limits": {
+    "rss": 8,
+    "news": 6,
+    "arxiv": 6,
+    "github": 5
+  },
+  "exclude_keywords": [
+    "free api key",
+    "free llm api keys",
+    "no credit card",
+    "jailbreak",
+    "bypass",
+    "破解",
+    "免费key",
+    "免费 api key"
+  ],
+  "keywords": [
+    "OpenAI",
+    "ChatGPT",
+    "Claude",
+    "Anthropic",
+    "Gemini",
+    "Google DeepMind",
+    "Microsoft Copilot",
+    "NVIDIA",
+    "AI agent",
+    "LLM",
+    "large language model",
+    "multimodal",
+    "AI coding",
+    "reasoning model",
+    "模型",
+    "大模型",
+    "智能体",
+    "多模态",
+    "推理模型",
+    "AI编程"
+  ],
+  "rss_feeds": [
+    {
+      "name": "OpenAI Blog",
+      "url": "https://openai.com/news/rss.xml"
+    },
+    {
+      "name": "Google DeepMind Blog",
+      "url": "https://deepmind.google/blog/rss.xml"
+    },
+    {
+      "name": "Google Gemini Blog",
+      "url": "https://blog.google/products-and-platforms/products/gemini/rss/"
+    },
+    {
+      "name": "Hugging Face Blog",
+      "url": "https://huggingface.co/blog/feed.xml"
+    },
+    {
+      "name": "MIT AI News",
+      "url": "https://news.mit.edu/topic/mitartificial-intelligence2-rss.xml"
+    }
+  ],
+  "official_pages": {
+    "enabled": true,
+    "max_links_per_source": 5,
+    "sources": [
+      {
+        "name": "Official Anthropic News",
+        "url": "https://www.anthropic.com/news",
+        "include_paths": [
+          "/news/"
+        ]
+      },
+      {
+        "name": "Official Mistral AI News",
+        "url": "https://mistral.ai/news",
+        "include_paths": [
+          "/news/"
+        ]
+      },
+      {
+        "name": "Official Meta AI Blog",
+        "url": "https://ai.meta.com/blog/",
+        "include_paths": [
+          "/blog/"
+        ]
+      },
+      {
+        "name": "Official Cohere Blog",
+        "url": "https://cohere.com/blog",
+        "include_paths": [
+          "/blog/"
+        ]
+      },
+      {
+        "name": "Official xAI News",
+        "url": "https://x.ai/news",
+        "include_paths": [
+          "/news/"
+        ]
+      },
+      {
+        "name": "Official Qwen Blog",
+        "url": "https://qwenlm.github.io/blog/",
+        "include_paths": [
+          "/blog/"
+        ]
+      },
+      {
+        "name": "Official DeepSeek News",
+        "url": "https://www.deepseek.com/news",
+        "include_paths": [
+          "/news/"
+        ]
+      },
+      {
+        "name": "Official Moonshot AI News",
+        "url": "https://www.moonshot.cn/news",
+        "include_paths": [
+          "/news/"
+        ]
+      },
+      {
+        "name": "Official Zhipu AI News",
+        "url": "https://www.zhipuai.cn/news",
+        "include_paths": [
+          "/news/"
+        ]
+      },
+      {
+        "name": "Official MiniMax News",
+        "url": "https://www.minimaxi.com/news",
+        "include_paths": [
+          "/news/"
+        ]
+      },
+      {
+        "name": "Official Tencent Hunyuan News",
+        "url": "https://hunyuan.tencent.com/news",
+        "include_paths": [
+          "/news/"
+        ]
+      },
+      {
+        "name": "Official Baidu ERNIE News",
+        "url": "https://yiyan.baidu.com/news",
+        "include_paths": [
+          "/news/"
+        ]
+      }
+    ]
+  },
+  "arxiv": {
+    "enabled": true,
+    "queries": [
+      "cat:cs.AI",
+      "cat:cs.CL",
+      "cat:cs.LG"
+    ],
+    "max_results": 20
+  },
+  "github": {
+    "enabled": true,
+    "commit_fetch_limit": 20,
+    "important_commit_limit": 6,
+    "queries": [
+      "topic:artificial-intelligence stars:>500 pushed:>=2026-01-01",
+      "topic:llm stars:>300 pushed:>=2026-01-01",
+      "topic:agents stars:>200 pushed:>=2026-01-01"
+    ],
+    "max_results": 10
+  },
+  "newsapi": {
+    "enabled": true,
+    "queries": [
+      "artificial intelligence",
+      "OpenAI OR Anthropic OR Gemini",
+      "Claude OR Anthropic"
+    ],
+    "page_size": 20
+  },
+  "push": {
+    "wecom": {
+      "enabled": true,
+      "mode": "file",
+      "markdown_max_bytes": 3900,
+      "markdown_item_limit": 6,
+      "markdown_item_summary_chars": 60,
+      "markdown_executive_summary_chars": 180,
+      "mentioned_mobile_list": []
+    }
+  },
+  "public_base_url": "",
+  "cover_image_url": "https://dummyimage.com/900x500/111827/ffffff.png&text=AI+Daily+Brief"
+}
