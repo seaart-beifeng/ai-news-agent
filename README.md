@@ -58,8 +58,9 @@ python3 src/daily_ai_news.py --config config.json --env .env
 
 ```text
 /Users/mac372/Desktop/beifeng/ai-news-agent/output/YYYY-MM-DD.html
-/Users/mac372/Desktop/beifeng/ai-news-agent/output/YYYY-MM-DD.json
 ```
+
+默认只生成 HTML。需要调试筛选结果时，可以把 `config.json` 里的 `output.write_json` 改为 `true`，额外生成 JSON。
 
 ## 3. 运行方式
 
@@ -77,7 +78,7 @@ python3 src/daily_ai_news.py --config config.json --env .env
 4. 按关键词、时间、来源类型打分筛选。
 5. 如果 `.env` 里有有效 `OPENAI_API_KEY`，调用 OpenAI Responses API 生成中文摘要、重要性评分和价值判断。
 6. 如果没有有效 `OPENAI_API_KEY`，使用本地规则生成短摘要兜底。
-7. 写入 `output/YYYY-MM-DD.html` 和 `output/YYYY-MM-DD.json`。
+7. 写入 `output/YYYY-MM-DD.html`。如果 `output.write_json=true`，额外写入 `output/YYYY-MM-DD.json` 供调试复盘。
 8. 如果开启企业微信推送，则发送 markdown、news 卡片或 HTML 文件。
 
 只生成本地文件、不推送：

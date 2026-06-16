@@ -1926,21 +1926,23 @@ def write_outputs(project_dir: Path, report_date: str, selected: list[Item], all
     output_dir = project_dir / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
     html_file = output_dir / f"{report_date}.html"
-    json_file = output_dir / f"{report_date}.json"
     html_file.write_text(render_html(report_date, selected, brief, config), encoding="utf-8")
-    json_file.write_text(
-        json.dumps(
-            {
-                "date": report_date,
-                "brief": brief,
-                "selected": [item.to_dict() for item in selected],
-                "ranked_candidates": [item.to_dict() for item in all_ranked],
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+    output_config = config.get("output", {})
+    if output_config.get("write_json", False):
+        json_file = output_dir / f"{report_date}.json"
+        json_file.write_text(
+            json.dumps(
+                {
+                    "date": report_date,
+                    "brief": brief,
+                    "selected": [item.to_dict() for item in selected],
+                    "ranked_candidates": [item.to_dict() for item in all_ranked],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
     return html_file
 
 

@@ -7,6 +7,9 @@
   "max_items_in_report": 18,
   "max_items_for_ai": 18,
   "openai_timeout_seconds": 180,
+  "output": {
+    "write_json": false
+  },
   "detail_fetch": {
     "enabled": true,
     "max_items": 18,
