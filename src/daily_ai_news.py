@@ -96,7 +96,14 @@ def parse_date(value: str) -> dt.datetime | None:
             parsed = parsed.replace(tzinfo=dt.timezone.utc)
         return parsed.astimezone(dt.timezone.utc)
     except Exception:
-        return None
+        pass
+    for fmt in ("%b %d, %Y", "%B %d, %Y", "%b %d %Y", "%B %d %Y"):
+        try:
+            parsed = dt.datetime.strptime(value, fmt)
+            return parsed.replace(tzinfo=dt.timezone.utc)
+        except Exception:
+            continue
+    return None
 
 
 def format_date(value: str) -> str:
@@ -1027,9 +1034,20 @@ def score_item(item: Item, config: dict[str, Any], cutoff: dt.datetime) -> int:
 
 def filter_and_rank(items: list[Item], config: dict[str, Any]) -> list[Item]:
     cutoff = utc_now() - dt.timedelta(hours=int(config.get("lookback_hours", 30)))
+    stale_without_date = bool(config.get("exclude_undated_items", False))
+    fresh_items: list[Item] = []
     for item in items:
+        parsed = parse_date(item.published_at)
+        if parsed is None:
+            if stale_without_date:
+                continue
+        elif parsed < cutoff:
+            continue
+        fresh_items.append(item)
+
+    for item in fresh_items:
         score_item(item, config, cutoff)
-    ranked = sorted(items, key=lambda i: (i.raw_score, parse_date(i.published_at) or dt.datetime.min.replace(tzinfo=dt.timezone.utc)), reverse=True)
+    ranked = sorted(fresh_items, key=lambda i: (i.raw_score, parse_date(i.published_at) or dt.datetime.min.replace(tzinfo=dt.timezone.utc)), reverse=True)
     min_score = int(config.get("min_score", 4))
     filtered = [item for item in ranked if item.raw_score >= min_score]
     limit = int(config.get("max_items_before_ai", 80))
