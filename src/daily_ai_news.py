@@ -578,6 +578,7 @@ def fetch_github(config: dict[str, Any]) -> list[Item]:
     if token:
         headers["Authorization"] = f"Bearer {token}"
     items: list[Item] = []
+    items.extend(fetch_github_watch_repositories(github, headers))
     max_results = int(github.get("max_results", 10))
     for query in github.get("queries", []):
         params = urllib.parse.urlencode(
@@ -595,25 +596,56 @@ def fetch_github(config: dict[str, Any]) -> list[Item]:
             print(f"[warn] GitHub failed: {query}: {exc}", file=sys.stderr)
             continue
         for repo in data.get("items", []):
-            full_name = repo.get("full_name", "")
-            html_url = repo.get("html_url", "")
-            stars = repo.get("stargazers_count", 0)
-            desc = repo.get("description") or ""
-            pushed_at = repo.get("pushed_at") or repo.get("updated_at") or ""
-            if full_name and html_url:
-                items.append(
-                    Item(
-                        id=stable_id(html_url, full_name),
-                        title=f"{full_name} ({stars:,} stars)",
-                        url=html_url,
-                        source="GitHub",
-                        kind="github",
-                        summary=truncate(desc, 500),
-                        published_at=pushed_at,
-                    )
-                )
+            item = github_repo_item(repo)
+            if item:
+                items.append(item)
         time.sleep(0.8)
     return items
+
+
+def fetch_github_watch_repositories(github: dict[str, Any], headers: dict[str, str]) -> list[Item]:
+    items: list[Item] = []
+    for full_name in github.get("repositories", []):
+        full_name = str(full_name).strip().strip("/")
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", full_name):
+            continue
+        api_url = f"https://api.github.com/repos/{full_name}"
+        try:
+            repo = request_json(api_url, headers=headers, timeout=15, retries=1)
+        except Exception as exc:
+            print(f"[warn] GitHub watch repository failed: {full_name}: {exc}", file=sys.stderr)
+            continue
+        item = github_repo_item(repo, source="GitHub Watchlist")
+        if item:
+            items.append(item)
+        time.sleep(0.3)
+    return items
+
+
+def github_repo_item(repo: dict[str, Any], source: str = "GitHub") -> Item | None:
+    full_name = repo.get("full_name", "")
+    html_url = repo.get("html_url", "")
+    if not full_name or not html_url:
+        return None
+    stars = repo.get("stargazers_count", 0)
+    desc = repo.get("description") or ""
+    homepage = repo.get("homepage") or ""
+    topics = repo.get("topics") or []
+    summary_parts = [desc]
+    if homepage:
+        summary_parts.append(f"Homepage: {homepage}")
+    if topics:
+        summary_parts.append("Topics: " + ", ".join(str(topic) for topic in topics[:8]))
+    pushed_at = repo.get("pushed_at") or repo.get("updated_at") or ""
+    return Item(
+        id=stable_id(html_url, full_name),
+        title=f"{full_name} ({stars:,} stars)",
+        url=html_url,
+        source=source,
+        kind="github",
+        summary=truncate(" ".join(part for part in summary_parts if part), 600),
+        published_at=pushed_at,
+    )
 
 
 def fetch_newsapi(config: dict[str, Any]) -> list[Item]:
@@ -1197,6 +1229,7 @@ def score_item(item: Item, config: dict[str, Any], cutoff: dt.datetime) -> int:
         "moonshot",
         "kimi",
         "zhipu",
+        "z.ai",
         "glm",
         "minimax",
         "hunyuan",
@@ -1210,6 +1243,8 @@ def score_item(item: Item, config: dict[str, Any], cutoff: dt.datetime) -> int:
 
     if item.kind in {"rss", "news", "official"}:
         score += 1
+    if item.source == "GitHub Watchlist":
+        score += 4
     if item.kind == "github" and re.search(r"\(([0-9,]+) stars\)", item.title):
         match = re.search(r"\(([0-9,]+) stars\)", item.title)
         stars = int(match.group(1).replace(",", "")) if match else 0

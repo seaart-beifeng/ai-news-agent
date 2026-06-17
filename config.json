@@ -64,6 +64,11 @@
     "multimodal",
     "AI coding",
     "reasoning model",
+    "Z.ai",
+    "Zhipu",
+    "GLM",
+    "GLM-5",
+    "GLM-5.2",
     "模型",
     "大模型",
     "智能体",
@@ -196,10 +201,18 @@
     "enabled": true,
     "commit_fetch_limit": 20,
     "important_commit_limit": 6,
+    "repositories": [
+      "zai-org/GLM-5",
+      "zai-org/GLM-V",
+      "zai-org/Open-AutoGLM",
+      "THUDM/slime"
+    ],
     "queries": [
       "topic:artificial-intelligence stars:>500 pushed:>=2026-01-01",
       "topic:llm stars:>300 pushed:>=2026-01-01",
-      "topic:agents stars:>200 pushed:>=2026-01-01"
+      "topic:agents stars:>200 pushed:>=2026-01-01",
+      "org:zai-org GLM pushed:>=2026-01-01",
+      "org:THUDM GLM pushed:>=2026-01-01"
     ],
     "max_results": 10
   },
@@ -208,7 +221,8 @@
     "queries": [
       "artificial intelligence",
       "OpenAI OR Anthropic OR Gemini",
-      "Claude OR Anthropic"
+      "Claude OR Anthropic",
+      "Z.ai OR Zhipu OR GLM-5 OR GLM-5.2"
     ],
     "page_size": 20
   },
