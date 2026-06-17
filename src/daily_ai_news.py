@@ -396,7 +396,7 @@ def extract_official_article_links(page: str, base_url: str, source: dict[str, A
             continue
         if exclude_paths and any(part in lowered_path for part in exclude_paths):
             continue
-        normalized = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+        normalized = clean_url(urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, "", "")))
         if normalized in seen:
             continue
         seen.add(normalized)
@@ -407,6 +407,7 @@ def extract_official_article_links(page: str, base_url: str, source: dict[str, A
 
 
 def official_article_item(source: str, url: str, page: str) -> Item | None:
+    url = clean_url(url)
     title = (
         meta_content(page, "og:title")
         or meta_content(page, "twitter:title")
@@ -893,6 +894,189 @@ def dedupe_items(items: list[Item]) -> list[Item]:
     return unique
 
 
+def load_published_history(project_dir: Path, report_date: str, config: dict[str, Any]) -> dict[str, Any]:
+    state_dir = project_dir / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    state_file = state_dir / "published_items.json"
+    history = {"version": 1, "items": {}}
+    if state_file.exists():
+        try:
+            loaded = json.loads(state_file.read_text(encoding="utf-8"))
+            if isinstance(loaded.get("items"), dict):
+                history["items"] = normalize_published_history_records(loaded["items"])
+        except Exception:
+            pass
+
+    history_config = config.get("history", {})
+    if history_config.get("bootstrap_from_output", True):
+        for key, record in bootstrap_published_history_from_outputs(project_dir, report_date).items():
+            history["items"].setdefault(key, record)
+    return history
+
+
+def normalize_published_history_records(records: dict[str, Any]) -> dict[str, dict[str, str]]:
+    normalized: dict[str, dict[str, str]] = {}
+    for record in records.values():
+        if not isinstance(record, dict):
+            continue
+        url = clean_url(str(record.get("url") or ""))
+        title = str(record.get("title") or "")
+        key = published_key_from_url_title(url, title)
+        if not key:
+            continue
+        existing = normalized.get(key)
+        first_published = str(record.get("first_published_at") or record.get("published_at") or "")
+        last_published = str(record.get("last_published_at") or first_published)
+        if existing:
+            existing["first_published_at"] = min(existing.get("first_published_at", first_published), first_published)
+            existing["last_published_at"] = max(existing.get("last_published_at", last_published), last_published)
+            continue
+        normalized[key] = {
+            "first_published_at": first_published,
+            "last_published_at": last_published,
+            "title": title,
+            "url": normalize_url(url),
+            "kind": str(record.get("kind") or "unknown"),
+            "source": str(record.get("source") or ""),
+        }
+    return normalized
+
+
+def bootstrap_published_history_from_outputs(project_dir: Path, report_date: str) -> dict[str, dict[str, str]]:
+    output_dir = project_dir / "output"
+    if not output_dir.exists():
+        return {}
+    records: dict[str, dict[str, str]] = {}
+    for html_file in sorted(output_dir.glob("*.html")):
+        published_on = html_file.stem
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", published_on) or published_on >= report_date:
+            continue
+        try:
+            page = html_file.read_text(encoding="utf-8", errors="replace")
+        except Exception as exc:
+            print(f"[warn] published history bootstrap skipped: {html_file.name}: {exc}", file=sys.stderr)
+            continue
+        for url, title in extract_output_links(page):
+            key = published_key_from_url_title(url, title)
+            if not key:
+                continue
+            records.setdefault(
+                key,
+                {
+                    "first_published_at": published_on,
+                    "last_published_at": published_on,
+                    "title": title,
+                    "url": normalize_url(url),
+                    "kind": "unknown",
+                    "source": "output",
+                },
+            )
+    return records
+
+
+def extract_output_links(page: str) -> list[tuple[str, str]]:
+    links: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for match in re.finditer(r'<a\b[^>]*\bhref=["\']([^"\']+)["\'][^>]*>(.*?)</a>', page, flags=re.I | re.S):
+        url = html.unescape(match.group(1)).strip()
+        title = strip_html(match.group(2))
+        if not url or not title or not url.startswith(("http://", "https://")):
+            continue
+        key = published_key_from_url_title(url, title)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        links.append((url, title))
+    return links
+
+
+def filter_previously_published(
+    items: list[Item],
+    history: dict[str, Any],
+    report_date: str,
+    config: dict[str, Any],
+) -> tuple[list[Item], int]:
+    history_config = config.get("history", {})
+    if not history_config.get("exclude_previously_published", True):
+        return items, 0
+
+    filter_kinds = set(history_config.get("filter_kinds", ["rss", "news", "official", "arxiv"]))
+    days = int(history_config.get("published_dedupe_days", 14))
+    report_day = parse_yyyy_mm_dd(report_date)
+    cutoff_day = report_day - dt.timedelta(days=days) if report_day and days > 0 else None
+    records = history.get("items", {})
+    fresh: list[Item] = []
+    skipped = 0
+    for item in items:
+        if item.kind not in filter_kinds:
+            fresh.append(item)
+            continue
+        record = records.get(published_key(item))
+        if not record:
+            fresh.append(item)
+            continue
+        first_published = str(record.get("first_published_at") or record.get("published_at") or "")
+        published_day = parse_yyyy_mm_dd(first_published)
+        if first_published >= report_date:
+            fresh.append(item)
+            continue
+        if cutoff_day and published_day and published_day < cutoff_day:
+            fresh.append(item)
+            continue
+        skipped += 1
+    return fresh, skipped
+
+
+def save_published_history(project_dir: Path, history: dict[str, Any], selected: list[Item], report_date: str) -> None:
+    state_dir = project_dir / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    records = history.setdefault("items", {})
+    for item in selected:
+        key = published_key(item)
+        record = records.get(key) or {}
+        first_published = record.get("first_published_at") or report_date
+        records[key] = {
+            "first_published_at": min(str(first_published), report_date),
+            "last_published_at": report_date,
+            "title": item.title,
+            "url": normalize_url(item.url),
+            "kind": item.kind,
+            "source": item.source,
+        }
+    state_file = state_dir / "published_items.json"
+    state_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "updated_at": utc_now().isoformat(),
+                "items": dict(sorted(records.items())),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def published_key(item: Item) -> str:
+    return published_key_from_url_title(item.url, item.title)
+
+
+def published_key_from_url_title(url: str, title: str) -> str:
+    normalized_url = normalize_url(url) if url else ""
+    if normalized_url:
+        return f"url:{normalized_url}"
+    title_key = re.sub(r"\W+", "", (title or "").lower())[:120]
+    return f"title:{title_key}" if title_key else ""
+
+
+def parse_yyyy_mm_dd(value: str) -> dt.date | None:
+    try:
+        return dt.datetime.strptime(value[:10], "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
 def mark_first_seen(items: list[Item], project_dir: Path) -> set[str]:
     state_dir = project_dir / "state"
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -930,6 +1114,7 @@ def seen_key(item: Item) -> str:
 
 
 def normalize_url(url: str) -> str:
+    url = clean_url(url)
     parsed = urllib.parse.urlsplit(url)
     query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=False)
     query = [(k, v) for k, v in query if not k.lower().startswith("utm_")]
@@ -942,6 +1127,10 @@ def normalize_url(url: str) -> str:
             "",
         )
     )
+
+
+def clean_url(url: str) -> str:
+    return html.unescape(url or "").strip().strip("\\'\"")
 
 
 def score_item(item: Item, config: dict[str, Any], cutoff: dt.datetime) -> int:
@@ -1969,6 +2158,10 @@ def main() -> int:
     print(f"[info] collecting items for {report_date}")
     items = collect_items(config)
     print(f"[info] collected {len(items)} unique items")
+    published_history = load_published_history(project_dir, report_date, config)
+    items, skipped_published = filter_previously_published(items, published_history, report_date, config)
+    if skipped_published:
+        print(f"[info] skipped {skipped_published} previously published items")
     ranked = filter_and_rank(items, config)
     print(f"[info] retained {len(ranked)} candidates")
     seen_after_run = mark_first_seen(ranked, project_dir)
@@ -1978,6 +2171,7 @@ def main() -> int:
     selected, brief = apply_ai_brief(ranked, brief, config, model_error)
     output_file = write_outputs(project_dir, report_date, selected, ranked, brief, config)
     save_seen_items(project_dir, seen_after_run)
+    save_published_history(project_dir, published_history, selected, report_date)
     print(f"[info] wrote {output_file}")
 
     if not args.no_push:

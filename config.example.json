@@ -10,6 +10,17 @@
   "output": {
     "write_json": false
   },
+  "history": {
+    "exclude_previously_published": true,
+    "published_dedupe_days": 14,
+    "bootstrap_from_output": true,
+    "filter_kinds": [
+      "rss",
+      "news",
+      "official",
+      "arxiv"
+    ]
+  },
   "detail_fetch": {
     "enabled": true,
     "max_items": 18,
