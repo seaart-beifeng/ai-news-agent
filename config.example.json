@@ -8,17 +8,21 @@
   "max_items_for_ai": 18,
   "openai_timeout_seconds": 180,
   "output": {
-    "write_json": false
+    "write_json": true
   },
   "history": {
     "exclude_previously_published": true,
     "published_dedupe_days": 14,
+    "dedupe_days_by_kind": {
+      "github": 3
+    },
     "bootstrap_from_output": true,
     "filter_kinds": [
       "rss",
       "news",
       "official",
-      "arxiv"
+      "arxiv",
+      "github"
     ]
   },
   "detail_fetch": {
@@ -39,6 +43,15 @@
     "arxiv": 6,
     "github": 5
   },
+  "exclude_domains": [
+    "pypi.org",
+    "biztoc.com",
+    "bitcoinfoundation.org",
+    "bitcoinist.com",
+    "cryptobriefing.com",
+    "coindesk.com",
+    "cointelegraph.com"
+  ],
   "exclude_keywords": [
     "free api key",
     "free llm api keys",
@@ -140,5 +153,14 @@
     }
   },
   "public_base_url": "",
-  "cover_image_url": "https://dummyimage.com/900x500/111827/ffffff.png&text=AI+Daily+Brief"
+  "cover_image_url": "https://dummyimage.com/900x500/111827/ffffff.png&text=AI+Daily+Brief",
+  "quality": {
+    "enabled": true,
+    "max_good_cases": 20,
+    "max_bad_cases": 20,
+    "max_per_kind": 6,
+    "max_age_days": 30,
+    "max_prompt_examples": 5,
+    "evaluation_timeout_seconds": 120
+  }
 }

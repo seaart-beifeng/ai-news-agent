@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import dataclasses
 import datetime as dt
 import email.utils
@@ -22,6 +23,25 @@ from typing import Any
 
 USER_AGENT = "ai-news-agent/0.1 (+local daily brief)"
 WECOM_MARKDOWN_MAX_BYTES = 3900
+
+SELECTION_RULES = [
+    "优先一手来源、重大模型/产品发布、AI Agent、基础设施、开源项目、研究突破、监管与商业动作。",
+    "降低营销稿、重复转载、纯观点、缺少事实依据的信息权重。",
+    "不要编造候选列表之外的信息。",
+    "summary_zh 必须基于 summary/details 用中文写出内容大纲，覆盖用途、核心能力、适用场景、主要结论和值得继续看的点。",
+    "不要限制 summary_zh 字数；内容复杂就写充分，内容简单就写简洁，避免空话。",
+    "GitHub 项目必须按固定结构写：项目介绍、当日重要提交、近期版本/发布、关注点。",
+    "项目介绍要总结 README 中的项目功能、核心能力、使用场景、技术特点，不要只翻译仓库 description。",
+    "当日重要提交必须用列表逐条列出，格式类似：- 2026-06-09 sha：这次提交做了什么、为什么重要。",
+    "当日重要提交只能使用 details 中 Important commits 的日期、sha、message；不要把过滤统计、Recent commits 或低信号体验项改写成重要提交。",
+    "UI/UX、文案、样式、图标、预览、普通错误提示、文件名冲突、README、格式化、依赖小升级通常不算重要提交，除非明确影响安全、数据正确性、RAG/索引、性能、API 兼容、模型/推理能力、Agent 行为或生产稳定性。",
+    "近期版本/发布要基于 Recent releases 总结 release 名称、日期和重点变化。",
+    '如果当日提交信息不足，要明确写"未从公开提交信息中识别到明确的当日重要提交"。',
+    '如果 GitHub 项目的 first_seen=true，summary_zh 必须以"首次收录项目。"开头，项目介绍可以更充分；如果 first_seen=false，要减少基础介绍，重点写更新变化。',
+    "新闻/论文要总结事实、背景、影响和可继续阅读的重点。",
+    "why_it_matters 必须用中文说明对 AI 从业者、产品或技术决策的具体意义，不要限制字数。",
+    'category 必须使用简短中文标签（如"模型发布"、"开源项目"、"研究论文"、"AI Agent"、"行业动态"、"安全/治理"）。全部条目合计不超过 6 个分类；相近主题必须合并到同一分类，不要每个条目创建独立分类。',
+]
 
 
 @dataclasses.dataclass
@@ -464,18 +484,17 @@ def clean_official_title(title: str, source: str) -> str:
 def looks_like_official_index_page(title: str, url: str, summary: str) -> bool:
     lowered_title = title.lower()
     lowered_url = urllib.parse.urlsplit(url).path.strip("/").lower()
+    if re.search(r"\bblog\s*\|", lowered_title):
+        return True
     category_titles = [
-        "blog | product launch",
-        "blog | research",
-        "blog | enterprise ai",
-        "blog | ai for developers",
         "newsroom",
         "press",
         "events",
     ]
     if lowered_title in category_titles:
         return True
-    if re.fullmatch(r"(blog|news|research|announcements|press)(/[a-z0-9-]+)?", lowered_url) and len(summary) < 300:
+    index_segments = r"(blog|news|research|announcements|press|tag|tags|category|categories|page|archive|archives)"
+    if re.fullmatch(rf"{index_segments}(/{index_segments}|/[a-z0-9-]+){{0,2}}", lowered_url) and len(summary) < 300:
         return True
     return False
 
@@ -653,6 +672,7 @@ def fetch_newsapi(config: dict[str, Any]) -> list[Item]:
     key = os.environ.get("NEWSAPI_KEY", "")
     if not newsapi.get("enabled", False) or not key:
         return []
+    exclude_domains = set(str(d).lower() for d in config.get("exclude_domains", []))
     items: list[Item] = []
     page_size = int(newsapi.get("page_size", 20))
     for query in newsapi.get("queries", []):
@@ -677,18 +697,22 @@ def fetch_newsapi(config: dict[str, Any]) -> list[Item]:
             source = (article.get("source") or {}).get("name") or "NewsAPI"
             summary = article.get("description") or article.get("content") or ""
             published = article.get("publishedAt") or ""
-            if title and link:
-                items.append(
-                    Item(
-                        id=stable_id(link, title),
-                        title=strip_html(title),
-                        url=link,
-                        source=source,
-                        kind="news",
-                        summary=truncate(strip_html(summary), 600),
-                        published_at=published,
-                    )
+            if not title or not link:
+                continue
+            link_host = urllib.parse.urlsplit(link).netloc.lower()
+            if any(domain in link_host for domain in exclude_domains):
+                continue
+            items.append(
+                Item(
+                    id=stable_id(link, title),
+                    title=strip_html(title),
+                    url=link,
+                    source=source,
+                    kind="news",
+                    summary=truncate(strip_html(summary), 600),
+                    published_at=published,
                 )
+            )
     return items
 
 
@@ -1033,9 +1057,9 @@ def filter_previously_published(
         return items, 0
 
     filter_kinds = set(history_config.get("filter_kinds", ["rss", "news", "official", "arxiv"]))
-    days = int(history_config.get("published_dedupe_days", 14))
+    default_days = int(history_config.get("published_dedupe_days", 14))
+    dedupe_days_by_kind: dict[str, int] = {str(k): int(v) for k, v in history_config.get("dedupe_days_by_kind", {}).items()}
     report_day = parse_yyyy_mm_dd(report_date)
-    cutoff_day = report_day - dt.timedelta(days=days) if report_day and days > 0 else None
     records = history.get("items", {})
     fresh: list[Item] = []
     skipped = 0
@@ -1052,6 +1076,8 @@ def filter_previously_published(
         if first_published >= report_date:
             fresh.append(item)
             continue
+        days = dedupe_days_by_kind.get(item.kind, default_days)
+        cutoff_day = report_day - dt.timedelta(days=days) if report_day and days > 0 else None
         if cutoff_day and published_day and published_day < cutoff_day:
             fresh.append(item)
             continue
@@ -1302,111 +1328,8 @@ def diversify_items(items: list[Item], kind_limits: dict[str, Any], total_limit:
     return selected
 
 
-def call_openai_for_brief(items: list[Item], config: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+def _make_api_request(payload: dict[str, Any], timeout: int) -> tuple[dict[str, Any] | None, str]:
     api_key = os.environ.get("OPENAI_API_KEY", "")
-    if not api_key or not items:
-        return None, "未配置 OPENAI_API_KEY"
-    model = os.environ.get("OPENAI_MODEL") or "gpt-5.5"
-    max_items = int(config.get("max_items_in_report", 18))
-    max_items_for_ai = int(config.get("max_items_for_ai", max_items))
-    timeout = int(config.get("openai_timeout_seconds", 180))
-    candidates = [
-        {
-            "id": item.id,
-            "title": item.title,
-            "source": item.source,
-            "kind": item.kind,
-            "url": item.url,
-            "summary": item.summary,
-            "details": item.details,
-            "published_at": item.published_at,
-            "raw_score": item.raw_score,
-            "first_seen": item.first_seen,
-        }
-        for item in items[: min(len(items), max_items_for_ai)]
-    ]
-    schema = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "headline": {"type": "string"},
-            "executive_summary": {"type": "string"},
-            "themes": {
-                "type": "array",
-                "items": {"type": "string"},
-                "maxItems": 5,
-            },
-            "items": {
-                "type": "array",
-                "maxItems": max_items,
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "id": {"type": "string"},
-                        "score": {"type": "integer", "minimum": 1, "maximum": 10},
-                        "importance": {"type": "string", "enum": ["high", "medium", "low"]},
-                        "category": {"type": "string"},
-                        "summary_zh": {"type": "string"},
-                        "why_it_matters": {"type": "string"},
-                        "action": {"type": "string"},
-                    },
-                    "required": [
-                        "id",
-                        "score",
-                        "importance",
-                        "category",
-                        "summary_zh",
-                        "why_it_matters",
-                        "action",
-                    ],
-                },
-            },
-        },
-        "required": ["headline", "executive_summary", "themes", "items"],
-    }
-    prompt = {
-        "task": "从候选信息中筛选真正重要的 AI 新闻、论文、产品和工程信息，生成中文日报。",
-        "selection_rules": [
-            "优先一手来源、重大模型/产品发布、AI Agent、基础设施、开源项目、研究突破、监管与商业动作。",
-            "降低营销稿、重复转载、纯观点、缺少事实依据的信息权重。",
-            "不要编造候选列表之外的信息。",
-            "summary_zh 必须基于 summary/details 用中文写出内容大纲，覆盖用途、核心能力、适用场景、主要结论和值得继续看的点。",
-            "不要限制 summary_zh 字数；内容复杂就写充分，内容简单就写简洁，避免空话。",
-            "GitHub 项目必须按固定结构写：项目介绍、当日重要提交、近期版本/发布、关注点。",
-            "项目介绍要总结 README 中的项目功能、核心能力、使用场景、技术特点，不要只翻译仓库 description。",
-            "当日重要提交必须用列表逐条列出，格式类似：- 2026-06-09 sha：这次提交做了什么、为什么重要。",
-            "当日重要提交只能使用 details 中 Important commits 的日期、sha、message；不要把过滤统计、Recent commits 或低信号体验项改写成重要提交。",
-            "UI/UX、文案、样式、图标、预览、普通错误提示、文件名冲突、README、格式化、依赖小升级通常不算重要提交，除非明确影响安全、数据正确性、RAG/索引、性能、API 兼容、模型/推理能力、Agent 行为或生产稳定性。",
-            "近期版本/发布要基于 Recent releases 总结 release 名称、日期和重点变化。",
-            "如果当日提交信息不足，要明确写“未从公开提交信息中识别到明确的当日重要提交”。",
-            "如果 GitHub 项目的 first_seen=true，summary_zh 必须以“首次收录项目。”开头，项目介绍可以更充分；如果 first_seen=false，要减少基础介绍，重点写更新变化。",
-            "新闻/论文要总结事实、背景、影响和可继续阅读的重点。",
-            "why_it_matters 必须用中文说明对 AI 从业者、产品或技术决策的具体意义，不要限制字数。",
-        ],
-        "max_items": max_items,
-        "candidates": candidates,
-    }
-    payload = {
-        "model": model,
-        "input": [
-            {
-                "role": "system",
-                "content": "你是一个严谨的 AI 行业情报分析员。输出必须是有效 JSON，中文表达简洁具体。",
-            },
-            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
-        ],
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": "daily_ai_news_brief",
-                "schema": schema,
-                "strict": True,
-            },
-            "verbosity": "low",
-        },
-        "reasoning": {"effort": "low"},
-    }
     req = urllib.request.Request(
         openai_responses_url(),
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -1422,21 +1345,336 @@ def call_openai_for_brief(items: list[Item], config: dict[str, Any]) -> tuple[di
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        print(f"[warn] OpenAI failed: HTTP {exc.code}: {body[:1000]}", file=sys.stderr)
-        return None, f"模型调用失败：HTTP {exc.code}"
+        print(f"[warn] API failed: HTTP {exc.code}: {body[:500]}", file=sys.stderr)
+        return None, f"HTTP {exc.code}"
+    except (TimeoutError, urllib.error.URLError, OSError) as exc:
+        print(f"[warn] API failed: {exc}", file=sys.stderr)
+        return None, f"timed out: {exc}"
     except Exception as exc:
-        print(f"[warn] OpenAI failed: {exc}", file=sys.stderr)
-        return None, f"模型调用失败：{exc}"
+        print(f"[warn] API failed: {exc}", file=sys.stderr)
+        return None, str(exc)
 
     text = extract_response_text(data)
     if not text:
-        print("[warn] OpenAI returned no text", file=sys.stderr)
-        return None, "模型调用失败：返回内容为空"
+        return None, "返回内容为空"
     try:
         return json.loads(text), ""
     except json.JSONDecodeError as exc:
-        print(f"[warn] OpenAI JSON parse failed: {exc}: {text[:500]}", file=sys.stderr)
-        return None, f"模型调用失败：JSON 解析失败：{exc}"
+        print(f"[warn] API JSON parse failed: {exc}: {text[:500]}", file=sys.stderr)
+        return None, f"JSON 解析失败：{exc}"
+
+
+def _build_single_payload(
+    candidates: list[dict[str, Any]], max_items: int, model: str,
+    quality_examples: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "headline": {"type": "string"},
+            "executive_summary": {"type": "string"},
+            "themes": {"type": "array", "items": {"type": "string"}, "maxItems": 5},
+            "items": {
+                "type": "array",
+                "maxItems": max_items,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "id": {"type": "string"},
+                        "score": {"type": "integer", "minimum": 1, "maximum": 10},
+                        "importance": {"type": "string", "enum": ["high", "medium", "low"]},
+                        "category": {"type": "string"},
+                        "summary_zh": {"type": "string"},
+                        "why_it_matters": {"type": "string"},
+                        "action": {"type": "string"},
+                    },
+                    "required": ["id", "score", "importance", "category", "summary_zh", "why_it_matters", "action"],
+                },
+            },
+        },
+        "required": ["headline", "executive_summary", "themes", "items"],
+    }
+    prompt: dict[str, Any] = {
+        "task": "从候选信息中筛选真正重要的 AI 新闻、论文、产品和工程信息，生成中文日报。",
+        "selection_rules": list(SELECTION_RULES),
+        "max_items": max_items,
+        "candidates": candidates,
+    }
+    if quality_examples:
+        prompt["quality_examples"] = quality_examples
+    return {
+        "model": model,
+        "input": [
+            {"role": "system", "content": "你是一个严谨的 AI 行业情报分析员。输出必须是有效 JSON，中文表达简洁具体。"},
+            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+        ],
+        "text": {
+            "format": {"type": "json_schema", "name": "daily_ai_news_brief", "schema": schema, "strict": True},
+            "verbosity": "low",
+        },
+        "reasoning": {"effort": "low"},
+    }
+
+
+def _items_to_candidates(items: list["Item"], limit: int) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": item.id, "title": item.title, "source": item.source,
+            "kind": item.kind, "url": item.url, "summary": item.summary,
+            "details": item.details, "published_at": item.published_at,
+            "raw_score": item.raw_score, "first_seen": item.first_seen,
+        }
+        for item in items[:limit]
+    ]
+
+
+def _is_retryable_error(error: str) -> bool:
+    return any(tag in error for tag in ("HTTP 502", "HTTP 503", "HTTP 504", "timed out"))
+
+
+def _call_openai_single(
+    items: list["Item"], config: dict[str, Any], quality_cases: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any] | None, str]:
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key or not items:
+        return None, "未配置 OPENAI_API_KEY"
+    model = os.environ.get("OPENAI_MODEL") or "gpt-5.5"
+    max_items = int(config.get("max_items_in_report", 18))
+    max_items_for_ai = int(config.get("max_items_for_ai", max_items))
+    timeout = int(config.get("openai_timeout_seconds", 180))
+
+    quality_examples: dict[str, Any] | None = None
+    if quality_cases:
+        quality_examples = select_cases_for_prompt(quality_cases, items, config)
+
+    attempts = [max_items_for_ai]
+    reduced = max(5, max_items_for_ai // 2)
+    if reduced < max_items_for_ai:
+        attempts.append(reduced)
+        if reduced > 5:
+            attempts.append(5)
+
+    last_error = ""
+    for attempt_limit in attempts:
+        candidates = _items_to_candidates(items, attempt_limit)
+        examples = quality_examples if attempt_limit == attempts[0] else None
+        payload = _build_single_payload(candidates, max_items, model, examples)
+        result, error = _make_api_request(payload, timeout)
+        if result:
+            return result, ""
+        last_error = f"模型调用失败：{error}"
+        if _is_retryable_error(error) and attempt_limit != attempts[-1]:
+            next_limit = attempts[attempts.index(attempt_limit) + 1]
+            print(f"[info] retrying with {next_limit} candidates (was {attempt_limit})", file=sys.stderr)
+            continue
+        return None, last_error
+
+    return None, last_error
+
+
+def _summarize_batch(
+    batch: list[dict[str, Any]], model: str, timeout: int,
+    quality_examples: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "id": {"type": "string"},
+                        "score": {"type": "integer", "minimum": 1, "maximum": 10},
+                        "importance": {"type": "string", "enum": ["high", "medium", "low"]},
+                        "category": {"type": "string"},
+                        "summary_zh": {"type": "string"},
+                        "why_it_matters": {"type": "string"},
+                        "action": {"type": "string"},
+                    },
+                    "required": ["id", "score", "importance", "category", "summary_zh", "why_it_matters", "action"],
+                },
+            },
+        },
+        "required": ["items"],
+    }
+    prompt: dict[str, Any] = {
+        "task": "为以下 AI 相关信息生成中文摘要和评分。",
+        "selection_rules": list(SELECTION_RULES),
+        "candidates": batch,
+    }
+    if quality_examples:
+        prompt["quality_examples"] = quality_examples
+    payload = {
+        "model": model,
+        "input": [
+            {"role": "system", "content": "你是一个严谨的 AI 行业情报分析员。输出必须是有效 JSON，中文表达简洁具体。"},
+            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+        ],
+        "text": {
+            "format": {"type": "json_schema", "name": "batch_summary", "schema": schema, "strict": True},
+            "verbosity": "low",
+        },
+        "reasoning": {"effort": "low"},
+    }
+    result, error = _make_api_request(payload, timeout)
+    if result and isinstance(result.get("items"), list):
+        return result["items"]
+    print(f"[warn] batch summarize failed: {error}", file=sys.stderr)
+    return []
+
+
+def _synthesize_brief(
+    item_results: list[dict[str, Any]], model: str, timeout: int,
+) -> dict[str, Any] | None:
+    summaries = []
+    for r in item_results:
+        summaries.append({
+            "id": r.get("id", ""),
+            "title": r.get("title", ""),
+            "category": r.get("category", ""),
+            "score": r.get("score", 5),
+            "summary_preview": (r.get("summary_zh", "") or "")[:100],
+        })
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "headline": {"type": "string"},
+            "executive_summary": {"type": "string"},
+            "themes": {"type": "array", "items": {"type": "string"}, "maxItems": 5},
+            "category_adjustments": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "id": {"type": "string"},
+                        "category": {"type": "string"},
+                    },
+                    "required": ["id", "category"],
+                },
+            },
+        },
+        "required": ["headline", "executive_summary", "themes", "category_adjustments"],
+    }
+    prompt = {
+        "task": "根据以下已生成的 AI 日报条目摘要，生成整体标题、摘要和主题标签。如果分类标签需要合并调整（不超过6个分类），在 category_adjustments 中给出。",
+        "items": summaries,
+    }
+    payload = {
+        "model": model,
+        "input": [
+            {"role": "system", "content": "你是一个严谨的 AI 行业情报分析员。输出必须是有效 JSON，中文表达简洁具体。"},
+            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+        ],
+        "text": {
+            "format": {"type": "json_schema", "name": "brief_synthesis", "schema": schema, "strict": True},
+            "verbosity": "low",
+        },
+        "reasoning": {"effort": "low"},
+    }
+    for attempt in range(2):
+        result, error = _make_api_request(payload, timeout)
+        if result:
+            return result
+        print(f"[warn] synthesis failed (attempt {attempt+1}/2): {error}", file=sys.stderr)
+    return None
+
+
+def _call_openai_concurrent(
+    items: list["Item"], config: dict[str, Any],
+    quality_cases: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any] | None, str]:
+    model = os.environ.get("OPENAI_MODEL") or "gpt-5.5"
+    max_items_for_ai = int(config.get("max_items_for_ai", int(config.get("max_items_in_report", 18))))
+    timeout = int(config.get("openai_timeout_seconds", 180))
+    batch_size = int(config.get("concurrent_batch_size", 3))
+    max_workers = int(config.get("concurrent_max_workers", 3))
+
+    quality_examples: dict[str, Any] | None = None
+    if quality_cases:
+        quality_examples = select_cases_for_prompt(quality_cases, items, config)
+
+    candidates = _items_to_candidates(items, max_items_for_ai)
+    batches = [candidates[i:i + batch_size] for i in range(0, len(candidates), batch_size)]
+    print(f"[info] concurrent mode: {len(candidates)} items in {len(batches)} batches (batch_size={batch_size})", file=sys.stderr)
+
+    item_by_id = {it.id: it for it in items}
+    all_results: list[dict[str, Any]] = []
+    summarized_ids: set[str] = set()
+    batch_members: list[list[dict[str, Any]]] = list(batches)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_summarize_batch, batch, model, timeout, quality_examples): idx
+            for idx, batch in enumerate(batches)
+        }
+        for future in concurrent.futures.as_completed(futures):
+            idx = futures[future]
+            try:
+                batch_items = future.result()
+                all_results.extend(batch_items)
+                summarized_ids.update(r.get("id", "") for r in batch_items)
+                print(f"[info] batch {idx+1}/{len(batches)}: got {len(batch_items)} items", file=sys.stderr)
+            except Exception as exc:
+                print(f"[warn] batch {idx+1}/{len(batches)} failed: {exc}", file=sys.stderr)
+
+    for batch_cands in batch_members:
+        for cand in batch_cands:
+            cid = cand.get("id", "")
+            if cid not in summarized_ids:
+                item = item_by_id.get(cid)
+                fallback_summary = local_summary(item) if item else cand.get("title", "")
+                all_results.append({
+                    "id": cid,
+                    "score": cand.get("raw_score", 5),
+                    "importance": "medium",
+                    "category": "行业动态",
+                    "summary_zh": fallback_summary,
+                    "why_it_matters": "该信息命中了 AI 重点关键词，建议结合原文判断影响范围。",
+                    "action": "关注",
+                })
+                print(f"[info] fallback local_summary for: {cid}", file=sys.stderr)
+
+    if not all_results:
+        return None, "模型调用失败：所有并发批次均失败"
+
+    candidate_map = {c["id"]: c for c in candidates}
+    for r in all_results:
+        cand = candidate_map.get(r.get("id", ""))
+        if cand:
+            r["title"] = cand.get("title", "")
+
+    print(f"[info] phase 1 done: {len(summarized_ids)}/{len(candidates)} items summarized ({len(all_results) - len(summarized_ids)} fallback)", file=sys.stderr)
+
+    synthesis = _synthesize_brief(all_results, model, timeout)
+
+    if synthesis:
+        cat_adj = {a["id"]: a["category"] for a in synthesis.get("category_adjustments", [])}
+        for r in all_results:
+            if r.get("id") in cat_adj:
+                r["category"] = cat_adj[r["id"]]
+
+    brief: dict[str, Any] = {
+        "headline": (synthesis or {}).get("headline", "今日 AI 信息简报"),
+        "executive_summary": (synthesis or {}).get("executive_summary", "基于并发模式生成。"),
+        "themes": (synthesis or {}).get("themes", ["模型与产品", "研究论文", "开源项目"]),
+        "items": all_results,
+    }
+    return brief, ""
+
+
+def call_openai_for_brief(items: list[Item], config: dict[str, Any], quality_cases: dict[str, Any] | None = None) -> tuple[dict[str, Any] | None, str]:
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key or not items:
+        return None, "未配置 OPENAI_API_KEY"
+
+    return _call_openai_concurrent(items, config, quality_cases)
 
 
 def extract_response_text(data: dict[str, Any]) -> str:
@@ -1484,27 +1722,24 @@ def apply_ai_brief(items: list[Item], brief: dict[str, Any] | None, config: dict
 
 
 def local_summary(item: Item, model_error: str = "") -> str:
-    if item.details or item.summary:
-        return local_model_required_summary(item, model_error)
+    content = _best_available_text(item)
+    if content:
+        prefix = "首次收录项目。" if item.kind == "github" and item.first_seen else ""
+        return prefix + outline_summary(content, 600)
     if item.kind == "arxiv":
-        return f"论文摘要：围绕“{clean_title(item.title)}”展开，建议结合原文判断方法和实验价值。"
+        return f"论文：{clean_title(item.title)}。建议结合原文判断方法和实验价值。"
     if item.kind == "github":
         prefix = "首次收录项目。" if item.first_seen else ""
-        return f"{prefix}未配置模型，无法把 README 自动总结成中文项目功能大纲；请配置 OPENAI_API_KEY 后重新生成。项目：{clean_title(item.title)}。"
-    return f"内容摘要：{clean_title(item.title)}。"
+        return f"{prefix}{clean_title(item.title)}。"
+    return f"{clean_title(item.title)}。"
 
 
-def local_model_required_summary(item: Item, model_error: str = "") -> str:
-    reason = model_error or "模型未返回可用结果"
-    if item.kind == "github":
-        prefix = "首次收录项目。" if item.first_seen else ""
-        return (
-            f"{prefix}已抓取该 GitHub 项目的 README，但中文功能总结生成失败。"
-            f"原因：{reason}。系统会在模型调用成功后总结项目功能、核心能力、适用场景和技术特点。"
-        )
-    if item.kind == "arxiv":
-        return f"已抓取论文摘要，但中文论文大纲生成失败。原因：{reason}。"
-    return f"已抓取原文内容，但中文内容大纲生成失败。原因：{reason}。"
+def _best_available_text(item: Item) -> str:
+    for text in (item.details, item.summary):
+        cleaned = re.sub(r"\s+", " ", text or "").strip()
+        if len(cleaned) >= 40:
+            return cleaned
+    return ""
 
 
 def clean_title(title: str) -> str:
@@ -1598,7 +1833,7 @@ def render_html(report_date: str, selected: list[Item], brief: dict[str, Any], c
 
     def signal_text(item: Item) -> str:
         text = re.sub(r"\s+", " ", item.reason or item.summary or "").strip()
-        return html.escape(truncate(text, 170))
+        return html.escape(compact_sentences(text, 280))
 
     priority_items = []
     for index, item in enumerate(selected[:3], start=1):
@@ -1612,8 +1847,12 @@ def render_html(report_date: str, selected: list[Item], brief: dict[str, Any], c
             """
         )
 
+    priority_ids = {item.id for item in selected[:3]}
+
     grouped: dict[str, list[tuple[int, Item]]] = {}
     for index, item in enumerate(selected, start=1):
+        if item.id in priority_ids:
+            continue
         grouped.setdefault(item.category or "其他", []).append((index, item))
 
     group_sections = []
@@ -2025,6 +2264,9 @@ def push_wecom(config: dict[str, Any], selected: list[Item], brief: dict[str, An
     webhook = os.environ.get("WECOM_WEBHOOK_URL", "")
     if not wecom.get("enabled", False) or not webhook:
         return
+    if not selected:
+        print("[info] no items selected; skipping WeCom push", file=sys.stderr)
+        return
     mode = wecom.get("mode", "markdown")
     public_url = build_public_url(config, output_file)
     mentioned_mobile_list = wecom.get("mentioned_mobile_list") or []
@@ -2136,6 +2378,673 @@ def check_wecom_result(result: Any, label: str) -> None:
         raise RuntimeError(f"WeCom {label} failed: {result}")
 
 
+def load_quality_cases(project_dir: Path) -> dict[str, Any]:
+    path = project_dir / "state" / "quality_cases.json"
+    if not path.exists():
+        return {"version": 1, "updated_at": "", "good_cases": [], "bad_cases": [], "evaluation_history": []}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"[warn] failed to load quality cases: {exc}", file=sys.stderr)
+        return {"version": 1, "updated_at": "", "good_cases": [], "bad_cases": [], "evaluation_history": []}
+
+
+def save_quality_cases(project_dir: Path, cases: dict[str, Any]) -> None:
+    state_dir = project_dir / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    cases["updated_at"] = utc_now().isoformat()
+    path = state_dir / "quality_cases.json"
+    path.write_text(json.dumps(cases, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"[info] saved quality cases to {path}", file=sys.stderr)
+
+
+def rotate_cases(case_list: list[dict[str, Any]], max_count: int, max_per_kind: int, max_age_days: int, today: str) -> list[dict[str, Any]]:
+    try:
+        today_date = dt.date.fromisoformat(today)
+    except Exception:
+        today_date = dt.date.today()
+    result = []
+    for case in case_list:
+        added = case.get("added_at", "")
+        try:
+            age = (today_date - dt.date.fromisoformat(added)).days
+        except Exception:
+            age = 999
+        if age <= max_age_days:
+            result.append(case)
+    result.sort(key=lambda c: c.get("added_at", ""), reverse=True)
+    kind_counts: dict[str, int] = {}
+    filtered = []
+    for case in result:
+        kind = case.get("kind", "unknown")
+        if kind_counts.get(kind, 0) >= max_per_kind:
+            continue
+        kind_counts[kind] = kind_counts.get(kind, 0) + 1
+        filtered.append(case)
+        if len(filtered) >= max_count:
+            break
+    return filtered
+
+
+def select_cases_for_prompt(cases: dict[str, Any], items: list["Item"], config: dict[str, Any]) -> dict[str, Any] | None:
+    quality_config = config.get("quality", {})
+    max_examples = int(quality_config.get("max_prompt_examples", 5))
+    good_cases = cases.get("good_cases", [])
+    bad_cases = cases.get("bad_cases", [])
+    if not good_cases and not bad_cases:
+        return None
+    item_kinds = {item.kind for item in items}
+    max_good = min(3, max_examples)
+    max_bad = max_examples - max_good
+
+    def pick(case_list: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+        matched = [c for c in case_list if c.get("kind") in item_kinds]
+        unmatched = [c for c in case_list if c.get("kind") not in item_kinds]
+        return (matched + unmatched)[:limit]
+
+    good_picked = pick(good_cases, max_good)
+    bad_picked = pick(bad_cases, max_bad)
+    if not good_picked and not bad_picked:
+        return None
+    examples: dict[str, Any] = {"instruction": "参考以上好案例的写法标准和坏案例的常见问题，提升输出质量。"}
+    if good_picked:
+        examples["good_examples"] = [
+            {"input": c["input_snippet"], "expected_output": c["output_snippet"], "why_good": c.get("reason", "")}
+            for c in good_picked
+        ]
+    if bad_picked:
+        examples["bad_examples"] = [
+            {"input": c["input_snippet"], "actual_output": c["output_snippet"], "why_bad": c.get("reason", "")}
+            for c in bad_picked
+        ]
+    return examples
+
+
+def evaluate_report_quality(
+    selected: list["Item"], brief: dict[str, Any], candidates: list["Item"], config: dict[str, Any]
+) -> dict[str, Any] | None:
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key or not selected:
+        return None
+    model = os.environ.get("OPENAI_MODEL") or "gpt-5.5"
+    quality_config = config.get("quality", {})
+    timeout = int(quality_config.get("evaluation_timeout_seconds", 120))
+
+    brief_items_by_id = {}
+    for bi in brief.get("items", []):
+        brief_items_by_id[bi.get("id", "")] = bi
+
+    eval_items = []
+    for item in selected:
+        bi = brief_items_by_id.get(item.id, {})
+        eval_items.append({
+            "id": item.id,
+            "title": item.title,
+            "kind": item.kind,
+            "source": item.source,
+            "original_summary": (item.details or item.summary or "")[:500],
+            "first_seen": item.first_seen,
+            "ai_summary_zh": bi.get("summary_zh", item.summary),
+            "ai_why_it_matters": bi.get("why_it_matters", item.reason),
+            "ai_category": bi.get("category", item.category),
+            "ai_score": bi.get("score", item.ai_score or item.raw_score),
+        })
+
+    eval_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "report_scores": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "headline_quality": {"type": "integer", "minimum": 1, "maximum": 5},
+                    "executive_summary_quality": {"type": "integer", "minimum": 1, "maximum": 5},
+                    "category_diversity": {"type": "integer", "minimum": 1, "maximum": 5},
+                    "importance_distribution": {"type": "integer", "minimum": 1, "maximum": 5},
+                },
+                "required": ["headline_quality", "executive_summary_quality", "category_diversity", "importance_distribution"],
+            },
+            "item_evaluations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "id": {"type": "string"},
+                        "summary_accuracy": {"type": "integer", "minimum": 1, "maximum": 5},
+                        "summary_specificity": {"type": "integer", "minimum": 1, "maximum": 5},
+                        "value_judgment": {"type": "integer", "minimum": 1, "maximum": 5},
+                        "category_correctness": {"type": "integer", "minimum": 1, "maximum": 5},
+                        "format_compliance": {"type": "integer", "minimum": 1, "maximum": 5},
+                        "score_calibration": {"type": "integer", "minimum": 1, "maximum": 5},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["id", "summary_accuracy", "summary_specificity", "value_judgment",
+                                 "category_correctness", "format_compliance", "score_calibration", "reason"],
+                },
+            },
+        },
+        "required": ["report_scores", "item_evaluations"],
+    }
+
+    prompt = {
+        "task": "你是 AI 日报质量评审员。评估以下已生成日报的质量，对每条内容逐项打分(1-5)。",
+        "scoring_criteria": {
+            "summary_accuracy": "summary_zh 是否忠实反映原文内容（original_summary），不添加、不遗漏关键事实",
+            "summary_specificity": "是否包含具体事实（数字、方法名、模型名、版本号），而非空话套话",
+            "value_judgment": "why_it_matters 是否有针对性地说明对 AI 从业者的意义，而非泛泛而谈",
+            "category_correctness": "分类标签是否恰当，是否与内容主题匹配",
+            "format_compliance": "GitHub 项目是否按结构写（项目介绍/提交/版本/关注点），论文是否总结方法和结论",
+            "score_calibration": "AI 打分是否合理（重大发布应高分，普通更新不应满分）",
+        },
+        "report_criteria": {
+            "headline_quality": "标题是否概括了当日最重要的主题",
+            "executive_summary_quality": "摘要是否精炼且有信息量",
+            "category_diversity": "分类是否合理，不超过6个且无过度碎片化",
+            "importance_distribution": "重要性标注分布是否合理",
+        },
+        "headline": brief.get("headline", ""),
+        "executive_summary": brief.get("executive_summary", ""),
+        "themes": brief.get("themes", []),
+        "items": eval_items,
+    }
+
+    payload = {
+        "model": model,
+        "input": [
+            {"role": "system", "content": "你是严谨的 AI 日报质量评审员。按评分标准逐项打分，给出具体理由。输出 JSON。"},
+            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+        ],
+        "text": {
+            "format": {"type": "json_schema", "name": "quality_evaluation", "schema": eval_schema, "strict": True},
+            "verbosity": "low",
+        },
+        "reasoning": {"effort": "low"},
+    }
+
+    req = urllib.request.Request(
+        openai_responses_url(),
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        print(f"[warn] quality evaluation failed: {exc}", file=sys.stderr)
+        return None
+
+    text = extract_response_text(data)
+    if not text:
+        print("[warn] quality evaluation returned no text", file=sys.stderr)
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        print(f"[warn] quality evaluation JSON parse failed: {exc}", file=sys.stderr)
+        return None
+
+
+def classify_and_store_cases(
+    project_dir: Path,
+    evaluation: dict[str, Any],
+    selected: list["Item"],
+    brief: dict[str, Any],
+    report_date: str,
+    config: dict[str, Any],
+) -> None:
+    quality_config = config.get("quality", {})
+    max_good = int(quality_config.get("max_good_cases", 20))
+    max_bad = int(quality_config.get("max_bad_cases", 20))
+    max_per_kind = int(quality_config.get("max_per_kind", 6))
+    max_age_days = int(quality_config.get("max_age_days", 30))
+
+    cases = load_quality_cases(project_dir)
+    items_by_id = {item.id: item for item in selected}
+    brief_items_by_id = {bi.get("id", ""): bi for bi in brief.get("items", [])}
+
+    good_count = 0
+    bad_count = 0
+
+    for item_eval in evaluation.get("item_evaluations", []):
+        item_id = item_eval.get("id", "")
+        item = items_by_id.get(item_id)
+        if not item:
+            continue
+        bi = brief_items_by_id.get(item_id, {})
+
+        scores = [
+            item_eval.get("summary_accuracy", 3),
+            item_eval.get("summary_specificity", 3),
+            item_eval.get("value_judgment", 3),
+            item_eval.get("category_correctness", 3),
+            item_eval.get("format_compliance", 3),
+            item_eval.get("score_calibration", 3),
+        ]
+        avg = sum(scores) / len(scores)
+        min_score = min(scores)
+
+        case_entry = {
+            "added_at": report_date,
+            "report_date": report_date,
+            "kind": item.kind,
+            "input_snippet": {
+                "title": item.title,
+                "source": item.source,
+                "kind": item.kind,
+                "summary": (item.details or item.summary or "")[:300],
+                "first_seen": item.first_seen,
+            },
+            "output_snippet": {
+                "summary_zh": bi.get("summary_zh", item.summary),
+                "why_it_matters": bi.get("why_it_matters", item.reason),
+                "category": bi.get("category", item.category),
+                "score": bi.get("score", item.ai_score or item.raw_score),
+            },
+            "reason": item_eval.get("reason", ""),
+        }
+
+        if min_score <= 2:
+            cases["bad_cases"].append(case_entry)
+            bad_count += 1
+        elif min_score >= 3 and avg >= 3.5:
+            cases["good_cases"].append(case_entry)
+            good_count += 1
+
+    cases["good_cases"] = rotate_cases(cases["good_cases"], max_good, max_per_kind, max_age_days, report_date)
+    cases["bad_cases"] = rotate_cases(cases["bad_cases"], max_bad, max_per_kind, max_age_days, report_date)
+
+    history = cases.setdefault("evaluation_history", [])
+    history.append({
+        "report_date": report_date,
+        "item_count": len(selected),
+        "good_count": good_count,
+        "bad_count": bad_count,
+        "report_scores": evaluation.get("report_scores", {}),
+    })
+    if len(history) > 90:
+        cases["evaluation_history"] = history[-90:]
+
+    save_quality_cases(project_dir, cases)
+    print(f"[info] quality: {good_count} good, {bad_count} bad cases from {len(selected)} items", file=sys.stderr)
+
+
+def print_evaluation_report(evaluation: dict[str, Any], report_date: str) -> None:
+    print(f"\n{'='*60}", file=sys.stderr)
+    print(f"  日报质量评估报告 - {report_date}", file=sys.stderr)
+    print(f"{'='*60}", file=sys.stderr)
+
+    report_scores = evaluation.get("report_scores", {})
+    if report_scores:
+        print("\n  整体评分:", file=sys.stderr)
+        labels = {
+            "headline_quality": "标题质量",
+            "executive_summary_quality": "摘要质量",
+            "category_diversity": "分类多样性",
+            "importance_distribution": "重要性分布",
+        }
+        for key, label in labels.items():
+            score = report_scores.get(key, "-")
+            print(f"    {label}: {score}/5", file=sys.stderr)
+
+    item_evals = evaluation.get("item_evaluations", [])
+    if item_evals:
+        print(f"\n  逐条评分 ({len(item_evals)} 条):", file=sys.stderr)
+        dims = ["summary_accuracy", "summary_specificity", "value_judgment",
+                "category_correctness", "format_compliance", "score_calibration"]
+        dim_labels = ["准确性", "具体性", "价值判断", "分类", "格式", "打分"]
+        print(f"    {'ID':<40} {'  '.join(f'{l:>4}' for l in dim_labels)}  avg", file=sys.stderr)
+        for ie in item_evals:
+            scores = [ie.get(d, 0) for d in dims]
+            avg = sum(scores) / len(scores) if scores else 0
+            short_id = ie.get("id", "?")[:38]
+            scores_str = "  ".join(f"{s:>4}" for s in scores)
+            print(f"    {short_id:<40} {scores_str}  {avg:.1f}", file=sys.stderr)
+
+    print(f"\n{'='*60}\n", file=sys.stderr)
+
+
+def run_check_mode(project_dir: Path, config: dict[str, Any], check_date: str) -> int:
+    json_path = project_dir / "output" / f"{check_date}.json"
+    if not json_path.exists():
+        print(f"[error] {json_path} not found. Run with output.write_json=true first.", file=sys.stderr)
+        return 1
+    try:
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"[error] failed to load {json_path}: {exc}", file=sys.stderr)
+        return 1
+
+    brief = data.get("brief", {})
+    selected_dicts = data.get("selected", [])
+    selected = []
+    for d in selected_dicts:
+        item = Item(
+            id=d.get("id", ""),
+            title=d.get("title", ""),
+            url=d.get("url", ""),
+            source=d.get("source", ""),
+            kind=d.get("kind", ""),
+            summary=d.get("summary", ""),
+            published_at=d.get("published_at", ""),
+            raw_score=d.get("raw_score", 0),
+            ai_score=d.get("ai_score"),
+            importance=d.get("importance", "medium"),
+            reason=d.get("reason", ""),
+            category=d.get("category", "AI"),
+            details=d.get("details", ""),
+            first_seen=d.get("first_seen", False),
+        )
+        selected.append(item)
+
+    candidates_dicts = data.get("ranked_candidates", [])
+    candidates = []
+    for d in candidates_dicts:
+        item = Item(
+            id=d.get("id", ""),
+            title=d.get("title", ""),
+            url=d.get("url", ""),
+            source=d.get("source", ""),
+            kind=d.get("kind", ""),
+            summary=d.get("summary", ""),
+            published_at=d.get("published_at", ""),
+            raw_score=d.get("raw_score", 0),
+            ai_score=d.get("ai_score"),
+            importance=d.get("importance", "medium"),
+            reason=d.get("reason", ""),
+            category=d.get("category", "AI"),
+            details=d.get("details", ""),
+            first_seen=d.get("first_seen", False),
+        )
+        candidates.append(item)
+
+    print(f"[info] evaluating report for {check_date} ({len(selected)} items)", file=sys.stderr)
+    evaluation = evaluate_report_quality(selected, brief, candidates, config)
+    if not evaluation:
+        print("[error] quality evaluation failed", file=sys.stderr)
+        return 1
+
+    print_evaluation_report(evaluation, check_date)
+    classify_and_store_cases(project_dir, evaluation, selected, brief, check_date, config)
+    return 0
+
+
+def generate_optimization_report(
+    history: list[dict[str, Any]],
+    bad_cases: list[dict[str, Any]],
+    good_cases: list[dict[str, Any]],
+    config: dict[str, Any],
+) -> dict[str, Any] | None:
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key:
+        print("[error] OPENAI_API_KEY required for --review", file=sys.stderr)
+        return None
+    model = os.environ.get("OPENAI_MODEL") or "gpt-5.5"
+    timeout = int(config.get("quality", {}).get("evaluation_timeout_seconds", 120))
+
+    recent_history = history[-7:]
+    dims = ["headline_quality", "executive_summary_quality", "category_diversity", "importance_distribution"]
+    dim_avgs: dict[str, float] = {}
+    for dim in dims:
+        vals = [h.get("report_scores", {}).get(dim, 0) for h in recent_history if h.get("report_scores", {}).get(dim)]
+        dim_avgs[dim] = round(sum(vals) / len(vals), 2) if vals else 0
+
+    trend_data = {
+        "days_covered": len(recent_history),
+        "report_dimension_averages": dim_avgs,
+        "daily_good_bad": [
+            {"date": h.get("report_date", ""), "items": h.get("item_count", 0),
+             "good": h.get("good_count", 0), "bad": h.get("bad_count", 0)}
+            for h in recent_history
+        ],
+    }
+
+    bad_summaries = []
+    for c in bad_cases[:20]:
+        bad_summaries.append({
+            "kind": c.get("kind", ""),
+            "title": c.get("input_snippet", {}).get("title", ""),
+            "output_summary_zh": c.get("output_snippet", {}).get("summary_zh", "")[:200],
+            "output_why_it_matters": c.get("output_snippet", {}).get("why_it_matters", "")[:200],
+            "reason": c.get("reason", ""),
+        })
+
+    good_summaries = []
+    for c in good_cases[:5]:
+        good_summaries.append({
+            "kind": c.get("kind", ""),
+            "title": c.get("input_snippet", {}).get("title", ""),
+            "reason": c.get("reason", ""),
+        })
+
+    numbered_rules = [{"index": i, "rule": r} for i, r in enumerate(SELECTION_RULES)]
+
+    review_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "overall_assessment": {"type": "string"},
+            "trend": {"type": "string", "enum": ["improving", "stable", "declining"]},
+            "top_issues": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "issue": {"type": "string"},
+                        "affected_dimension": {"type": "string"},
+                        "frequency": {"type": "string"},
+                        "example_titles": {"type": "array", "items": {"type": "string"}},
+                        "root_cause": {"type": "string"},
+                    },
+                    "required": ["issue", "affected_dimension", "frequency", "example_titles", "root_cause"],
+                },
+            },
+            "rule_suggestions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "action": {"type": "string", "enum": ["add", "modify", "delete"]},
+                        "target_rule_index": {"type": ["integer", "null"]},
+                        "current_rule": {"type": "string"},
+                        "suggested_rule": {"type": "string"},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["action", "target_rule_index", "current_rule", "suggested_rule", "reason"],
+                },
+            },
+            "config_suggestions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "key": {"type": "string"},
+                        "current_value": {"type": "string"},
+                        "suggested_value": {"type": "string"},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["key", "current_value", "suggested_value", "reason"],
+                },
+            },
+        },
+        "required": ["overall_assessment", "trend", "top_issues", "rule_suggestions", "config_suggestions"],
+    }
+
+    prompt = {
+        "task": "你是 AI 日报系统的 prompt 优化顾问。根据近期质量评估数据和 bad case 分析，给出具体的 prompt 规则修改建议。",
+        "trend_data": trend_data,
+        "bad_cases": bad_summaries,
+        "good_cases_reference": good_summaries,
+        "current_selection_rules": numbered_rules,
+        "instructions": [
+            "分析 bad case 的共性问题，找出最常出现的质量缺陷模式。",
+            "针对每个问题，判断是否可以通过修改 selection_rules 来解决。",
+            "rule_suggestions 中 target_rule_index 必须对应 current_selection_rules 中的 index；add 时设为 null。",
+            "config_suggestions 用于建议调整 config.json 中的参数（如 min_score、report_kind_limits 等）。",
+            "只建议有明确证据支持的修改，不要泛泛而谈。",
+            "如果质量已经很好，可以返回空的 rule_suggestions 和 config_suggestions。",
+        ],
+    }
+
+    payload = {
+        "model": model,
+        "input": [
+            {"role": "system", "content": "你是 AI 日报系统的 prompt 优化顾问。分析质量数据，输出结构化优化建议。输出 JSON。"},
+            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+        ],
+        "text": {
+            "format": {"type": "json_schema", "name": "optimization_report", "schema": review_schema, "strict": True},
+            "verbosity": "low",
+        },
+        "reasoning": {"effort": "medium"},
+    }
+
+    req = urllib.request.Request(
+        openai_responses_url(),
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        print(f"[error] optimization report generation failed: {exc}", file=sys.stderr)
+        return None
+
+    text = extract_response_text(data)
+    if not text:
+        print("[error] optimization report returned no text", file=sys.stderr)
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        print(f"[error] optimization report JSON parse failed: {exc}", file=sys.stderr)
+        return None
+
+
+def render_review_markdown(report: dict[str, Any], report_date: str) -> str:
+    trend_label = {"improving": "上升", "stable": "持平", "declining": "下降"}.get(
+        report.get("trend", "stable"), "持平"
+    )
+    lines = [
+        f"# AI 日报优化建议报告 - {report_date}",
+        "",
+        "## 总体评估",
+        "",
+        f"**趋势**: {trend_label}",
+        "",
+        report.get("overall_assessment", ""),
+        "",
+    ]
+
+    top_issues = report.get("top_issues", [])
+    if top_issues:
+        lines.append("## 主要问题")
+        lines.append("")
+        for i, issue in enumerate(top_issues, 1):
+            lines.append(f"### {i}. {issue.get('issue', '')}")
+            lines.append("")
+            lines.append(f"- **影响维度**: {issue.get('affected_dimension', '')}")
+            lines.append(f"- **出现频率**: {issue.get('frequency', '')}")
+            lines.append(f"- **根因分析**: {issue.get('root_cause', '')}")
+            examples = issue.get("example_titles", [])
+            if examples:
+                lines.append(f"- **涉及条目**: {', '.join(examples[:5])}")
+            lines.append("")
+
+    rule_suggestions = report.get("rule_suggestions", [])
+    if rule_suggestions:
+        lines.append("## Prompt 规则修改建议")
+        lines.append("")
+        for i, s in enumerate(rule_suggestions, 1):
+            action = {"add": "新增", "modify": "修改", "delete": "删除"}.get(s.get("action", ""), s.get("action", ""))
+            lines.append(f"### {i}. [{action}] 规则")
+            lines.append("")
+            if s.get("current_rule"):
+                idx = s.get("target_rule_index")
+                idx_str = f" (index {idx})" if idx is not None else ""
+                lines.append(f"**当前{idx_str}**:")
+                lines.append(f"> {s['current_rule']}")
+                lines.append("")
+            if s.get("suggested_rule"):
+                lines.append("**建议**:")
+                lines.append(f"> {s['suggested_rule']}")
+                lines.append("")
+            lines.append(f"**理由**: {s.get('reason', '')}")
+            lines.append("")
+        lines.append("**操作方式**: 修改 `src/daily_ai_news.py` 中的 `SELECTION_RULES` 列表。")
+        lines.append("")
+
+    config_suggestions = report.get("config_suggestions", [])
+    if config_suggestions:
+        lines.append("## Config 调参建议")
+        lines.append("")
+        lines.append("| 参数 | 当前值 | 建议值 | 理由 |")
+        lines.append("|------|--------|--------|------|")
+        for s in config_suggestions:
+            lines.append(f"| `{s.get('key', '')}` | {s.get('current_value', '')} | {s.get('suggested_value', '')} | {s.get('reason', '')} |")
+        lines.append("")
+        lines.append("**操作方式**: 修改 `config.json` 中对应的字段。")
+        lines.append("")
+
+    if not rule_suggestions and not config_suggestions:
+        lines.append("## 建议")
+        lines.append("")
+        lines.append("当前质量表现良好，暂无需要修改的规则或配置。")
+        lines.append("")
+
+    lines.append("---")
+    lines.append("*本报告由 AI 自动生成，请人工审核后再合入修改。*")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def run_review_mode(project_dir: Path, config: dict[str, Any]) -> int:
+    cases = load_quality_cases(project_dir)
+    history = cases.get("evaluation_history", [])
+    bad_cases = cases.get("bad_cases", [])
+    good_cases = cases.get("good_cases", [])
+
+    if len(history) < 3:
+        print("[error] need at least 3 days of evaluation history for --review. Run daily reports first.", file=sys.stderr)
+        return 1
+
+    if not bad_cases:
+        print("[info] no bad cases found. Quality is good, no optimization needed.", file=sys.stderr)
+        return 0
+
+    report_date = local_now(config.get("timezone", "Asia/Shanghai")).strftime("%Y-%m-%d")
+    print(f"[info] generating optimization report ({len(bad_cases)} bad cases, {len(history)} days of history)", file=sys.stderr)
+
+    report = generate_optimization_report(history, bad_cases, good_cases, config)
+    if not report:
+        print("[error] failed to generate optimization report", file=sys.stderr)
+        return 1
+
+    md = render_review_markdown(report, report_date)
+    output_dir = project_dir / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"review-{report_date}.md"
+    output_path.write_text(md, encoding="utf-8")
+    print(f"[info] wrote {output_path}", file=sys.stderr)
+    print(md)
+    return 0
+
+
 def collect_items(config: dict[str, Any]) -> list[Item]:
     items: list[Item] = []
     items.extend(fetch_rss_feeds(config))
@@ -2175,6 +3084,10 @@ def main() -> int:
     parser.add_argument("--config", default="config.json")
     parser.add_argument("--env", default=".env")
     parser.add_argument("--no-push", action="store_true")
+    parser.add_argument("--check", nargs="?", const="today", default=None,
+                        help="Evaluate quality of a generated report. Pass a date (YYYY-MM-DD) or omit for today.")
+    parser.add_argument("--review", action="store_true",
+                        help="Generate weekly optimization report based on accumulated bad cases.")
     args = parser.parse_args()
 
     project_dir = Path(__file__).resolve().parents[1]
@@ -2190,6 +3103,13 @@ def main() -> int:
     (project_dir / "logs").mkdir(exist_ok=True)
     report_date = local_now(config.get("timezone", "Asia/Shanghai")).strftime("%Y-%m-%d")
 
+    if args.check is not None:
+        check_date = report_date if args.check == "today" else args.check
+        return run_check_mode(project_dir, config, check_date)
+
+    if args.review:
+        return run_review_mode(project_dir, config)
+
     print(f"[info] collecting items for {report_date}")
     items = collect_items(config)
     print(f"[info] collected {len(items)} unique items")
@@ -2202,12 +3122,20 @@ def main() -> int:
     seen_after_run = mark_first_seen(ranked, project_dir)
     print("[info] fetching item details")
     enrich_item_details(ranked, config)
-    brief, model_error = call_openai_for_brief(ranked, config)
+    quality_cases = load_quality_cases(project_dir)
+    brief, model_error = call_openai_for_brief(ranked, config, quality_cases)
     selected, brief = apply_ai_brief(ranked, brief, config, model_error)
     output_file = write_outputs(project_dir, report_date, selected, ranked, brief, config)
     save_seen_items(project_dir, seen_after_run)
     save_published_history(project_dir, published_history, selected, report_date)
     print(f"[info] wrote {output_file}")
+
+    quality_config = config.get("quality", {})
+    if quality_config.get("enabled", True) and brief and not model_error:
+        evaluation = evaluate_report_quality(selected, brief, ranked, config)
+        if evaluation:
+            classify_and_store_cases(project_dir, evaluation, selected, brief, report_date, config)
+            print_evaluation_report(evaluation, report_date)
 
     if not args.no_push:
         push_wecom(config, selected, brief, report_date, output_file)
