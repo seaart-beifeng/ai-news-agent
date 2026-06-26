@@ -25,7 +25,7 @@ USER_AGENT = "ai-news-agent/0.1 (+local daily brief)"
 WECOM_MARKDOWN_MAX_BYTES = 3900
 
 SELECTION_RULES = [
-    "优先一手来源、重大模型/产品发布、AI Agent、基础设施、开源项目、研究突破、监管与商业动作。",
+    "优先一手来源、重大模型/产品发布、AI Agent、AI 工程化（框架/SDK/工具链/部署/推理优化/RAG/向量数据库/评测/可观测性/MLOps）、基础设施、开源项目、研究突破、监管与商业动作。",
     "降低营销稿、重复转载、纯观点、缺少事实依据的信息权重。",
     "不要编造候选列表之外的信息。",
     "summary_zh 必须基于 summary/details 用中文写出内容大纲，覆盖用途、核心能力、适用场景、主要结论和值得继续看的点。",
@@ -39,6 +39,7 @@ SELECTION_RULES = [
     '如果当日提交信息不足，要明确写"未从公开提交信息中识别到明确的当日重要提交"。',
     '如果 GitHub 项目的 first_seen=true，summary_zh 必须以"首次收录项目。"开头，项目介绍可以更充分；如果 first_seen=false，要减少基础介绍，重点写更新变化。',
     "新闻/论文要总结事实、背景、影响和可继续阅读的重点。",
+    "AI 工程化内容（如推理框架、部署方案、RAG 架构、评测工具、Agent 框架、SDK 更新、向量数据库、可观测性工具等）对从业者有很高实用价值，选题时应适当倾斜。",
     "why_it_matters 必须用中文说明对 AI 从业者、产品或技术决策的具体意义，不要限制字数。",
     'category 必须使用简短中文标签（如"模型发布"、"开源项目"、"研究论文"、"AI Agent"、"行业动态"、"安全/治理"）。全部条目合计不超过 6 个分类；相近主题必须合并到同一分类，不要每个条目创建独立分类。',
 ]
@@ -1209,6 +1210,20 @@ def score_item(item: Item, config: dict[str, Any], cutoff: dt.datetime) -> int:
         "safety",
         "policy",
         "regulation",
+        "framework",
+        "sdk",
+        "inference",
+        "deploy",
+        "rag",
+        "vector",
+        "embedding",
+        "fine-tune",
+        "finetune",
+        "mlops",
+        "observability",
+        "evaluation",
+        "tool chain",
+        "toolchain",
         "发布",
         "模型",
         "论文",
@@ -1217,6 +1232,13 @@ def score_item(item: Item, config: dict[str, Any], cutoff: dt.datetime) -> int:
         "监管",
         "安全",
         "智能体",
+        "框架",
+        "推理",
+        "部署",
+        "微调",
+        "向量",
+        "评测",
+        "工具链",
     ]
     score += sum(1 for term in high_signal_terms if term in title)
 
