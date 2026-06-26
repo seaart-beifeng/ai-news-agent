@@ -1057,9 +1057,6 @@ def filter_previously_published(
         return items, 0
 
     filter_kinds = set(history_config.get("filter_kinds", ["rss", "news", "official", "arxiv"]))
-    default_days = int(history_config.get("published_dedupe_days", 14))
-    dedupe_days_by_kind: dict[str, int] = {str(k): int(v) for k, v in history_config.get("dedupe_days_by_kind", {}).items()}
-    report_day = parse_yyyy_mm_dd(report_date)
     records = history.get("items", {})
     fresh: list[Item] = []
     skipped = 0
@@ -1072,13 +1069,7 @@ def filter_previously_published(
             fresh.append(item)
             continue
         first_published = str(record.get("first_published_at") or record.get("published_at") or "")
-        published_day = parse_yyyy_mm_dd(first_published)
         if first_published >= report_date:
-            fresh.append(item)
-            continue
-        days = dedupe_days_by_kind.get(item.kind, default_days)
-        cutoff_day = report_day - dt.timedelta(days=days) if report_day and days > 0 else None
-        if cutoff_day and published_day and published_day < cutoff_day:
             fresh.append(item)
             continue
         skipped += 1
